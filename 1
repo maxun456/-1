@@ -1,1 +1,175 @@
-nn
+/**
+ * 华住会 自动获取 Cookie —— Quantumult X 重写脚本
+ *
+ * 作用：你在华住会 App 里随便打开一个会员/积分页面，QX 拦到请求后自动把
+ *      Cookie、Authorization、User-Agent 存进本地（$prefs），并弹一条通知。
+ *      之后签到脚本 hzh.qx.js 直接用这份凭证，你不用再手动抄 Cookie。
+ *
+ * [rewrite_local]  二选一或都加
+ *   ^https:\/\/appgw\.huazhu\.com\/ url script-request-header https://raw.githubusercontent.com/你的用户名/你的仓库/main/hzh.cookie.qx.js
+ *   ^https:\/\/h5\.huazhu\.com\/    url script-request-header https://raw.githubusercontent.com/你的用户名/你的仓库/main/hzh.cookie.qx.js
+ *
+ * [mitm]
+ *   hostname = appgw.huazhu.com, h5.huazhu.com, www.huazhu.com
+ *
+ * 说明
+ *   - 只处理含 huazhu 的域名，其它流量原样放行
+ *   - 同一个账号重复抓取会自动更新，不会堆重复项，最多保留 20 个账号
+ *   - 抓不到 Cookie 时会尝试从响应头 Set-Cookie 里捡
+ */
+
+const KEY = "hzh_cookies";
+const MAX_ACCOUNTS = 20;
+const DOMAIN_ALLOW = /huazhu\.com/i;
+
+function log() {
+  console.log("[华住会Cookie] " + Array.prototype.slice.call(arguments).join(" "));
+}
+
+function safeGet(obj, key) {
+  if (!obj) return "";
+  var k = Object.keys(obj);
+  for (var i = 0; i < k.length; i++) {
+    if (k[i].toLowerCase() === String(key).toLowerCase()) return obj[k[i]];
+  }
+  return "";
+}
+
+function loadList() {
+  var raw = $prefs.valueForKey(KEY);
+  if (!raw) return [];
+  try {
+    var arr = JSON.parse(raw);
+    return arr instanceof Array ? arr : [];
+  } catch (e) {
+    log("已有数据解析失败，按空列表处理");
+    return [];
+  }
+}
+
+function saveList(arr) {
+  $prefs.setValueForKey(JSON.stringify(arr), KEY);
+}
+
+function pickCookie() {
+  var cookie = "";
+
+  // 1. 请求头（script-request-header 触发时可用）
+  if (typeof $request !== "undefined" && $request) {
+    var h = $request.headers || {};
+    cookie = safeGet(h, "Cookie");
+    if (!cookie) {
+      var ck = safeGet(h, "Set-Cookie");
+      if (ck) cookie = ck;
+    }
+  }
+
+  // 2. 响应头（script-response-header 触发时可用）
+  if (!cookie && typeof $response !== "undefined" && $response) {
+    var rh = $response.headers || {};
+    var sc = safeGet(rh, "Set-Cookie");
+    if (sc) {
+      if (sc instanceof Array) sc = sc.join("; ");
+      // 只取 name=value 部分，丢掉 Path/Domain/Expires 等属性
+      var parts = String(sc).split(/,\s*(?=[^;=]+=)/);
+      var keep = [];
+      for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i].split(";")[0].trim();
+        if (seg.indexOf("=") > 0) keep.push(seg);
+      }
+      cookie = keep.join("; ");
+    }
+  }
+
+  return cookie || "";
+}
+
+function pickAuth() {
+  var auth = "";
+  if (typeof $request !== "undefined" && $request) {
+    var h = $request.headers || {};
+    auth = safeGet(h, "Authorization") || safeGet(h, "authorization");
+    if (!auth) auth = safeGet(h, "token");
+  }
+  return auth || "";
+}
+
+function pickUA() {
+  var ua = "";
+  if (typeof $request !== "undefined" && $request) {
+    ua = safeGet($request.headers || {}, "User-Agent");
+  }
+  return ua || "";
+}
+
+(function () {
+  try {
+    var url = "";
+    if (typeof $request !== "undefined" && $request && $request.url) url = $request.url;
+    else if (typeof $response !== "undefined" && $response && $response.url) url = $response.url;
+
+    if (url && !DOMAIN_ALLOW.test(url)) {
+      // 不是华住会的请求，直接放行
+      $done({});
+      return;
+    }
+
+    var cookie = pickCookie();
+    var auth = pickAuth();
+    var ua = pickUA();
+
+    if (!cookie && !auth) {
+      log("本次请求没带 Cookie / Authorization，放行：" + url);
+      $done({});
+      return;
+    }
+
+    // 把 Authorization 也补进 Cookie 串，方便有些只认 cookie 的接口
+    if (auth && cookie && cookie.indexOf("token=") < 0) {
+      cookie = cookie + "; token=" + String(auth).replace(/^Bearer\s+/i, "");
+    }
+
+    var list = loadList();
+    var fingerprint = String(cookie || auth).slice(0, 80);
+    var found = -1;
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i] || {};
+      if (String(item.cookie || item.auth || "").slice(0, 80) === fingerprint) {
+        found = i;
+        break;
+      }
+    }
+
+    var account = {
+      name: "账号" + (found >= 0 ? found + 1 : list.length + 1),
+      cookie: cookie,
+      auth: auth,
+      ua: ua,
+      updatedAt: Date.now(),
+    };
+
+    var isNew = found < 0;
+    if (isNew) {
+      list.push(account);
+      if (list.length > MAX_ACCOUNTS) list = list.slice(list.length - MAX_ACCOUNTS);
+      // 修正显示名
+      for (var j = 0; j < list.length; j++) list[j].name = "账号" + (j + 1);
+    } else {
+      list[found] = account;
+    }
+
+    saveList(list);
+
+    if (isNew) {
+      $notify("华住会", "✅ 获取Cookie成功", "已保存 " + list.length + " 个账号\n" + url.replace(/\?.*$/, "").slice(0, 80));
+      log("新增账号，共 " + list.length + " 个，来源：" + url);
+    } else {
+      log("账号已存在，已更新（共 " + list.length + " 个）");
+    }
+  } catch (e) {
+    log("异常：" + (e && e.stack ? e.stack : e));
+  }
+  $done({});
+})();
+
+
